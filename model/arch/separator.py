@@ -11,6 +11,7 @@ Architecture:
 import torch
 import torch.nn as nn
 from typing import Tuple
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .band_split import BandSplit, BandMerge
 from .mamba_blocks import EncoderBlock, DownSample, UpSample, DualPathBiMambaBlock
@@ -59,6 +60,15 @@ class VocalSeparator(nn.Module):
         dropout: float = 0.0,
         use_mid_side: bool = False,
         d_state: int = 32,
+        ssm_variant: str = "mamba",
+        d_conv: int = 4,
+        expand: int = 2,
+        mamba3_headdim: int = 64,
+        mamba3_is_mimo: bool = False,
+        mamba3_mimo_rank: int = 4,
+        mamba3_chunk_size: int = 32,
+        mamba3_is_outproj_norm: bool = False,
+        use_gradient_checkpointing: bool | str = False,
     ):
         super().__init__()
         self.n_fft = n_fft
@@ -66,6 +76,22 @@ class VocalSeparator(nn.Module):
         self.sr = sr
         self.d_model = d_model
         self.use_mid_side = use_mid_side
+        self.ssm_variant = ssm_variant
+        self.gradient_checkpointing_mode = self._normalize_checkpoint_mode(
+            use_gradient_checkpointing
+        )
+
+        ssm_kwargs = dict(
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            ssm_variant=ssm_variant,
+            mamba3_headdim=mamba3_headdim,
+            mamba3_is_mimo=mamba3_is_mimo,
+            mamba3_mimo_rank=mamba3_mimo_rank,
+            mamba3_chunk_size=mamba3_chunk_size,
+            mamba3_is_outproj_norm=mamba3_is_outproj_norm,
+        )
 
         # Band split/merge
         self.band_split = BandSplit(n_fft, sr, d_model)
@@ -75,28 +101,28 @@ class VocalSeparator(nn.Module):
         # ===== ENCODER (Mamba) =====
         # Level 1: Fine temporal patterns
         self.enc1 = nn.ModuleList([
-            EncoderBlock(d_model, use_conv=True, d_state=d_state)
+            EncoderBlock(d_model, use_conv=True, **ssm_kwargs)
             for _ in range(n_encoder_layers)
         ])
         self.down1 = DownSample(d_model)
 
         # Level 2: Note-level patterns
         self.enc2 = nn.ModuleList([
-            EncoderBlock(d_model, use_conv=True, d_state=d_state)
+            EncoderBlock(d_model, use_conv=True, **ssm_kwargs)
             for _ in range(n_encoder_layers)
         ])
         self.down2 = DownSample(d_model)
 
         # Level 3: Phrase-level patterns
         self.enc3 = nn.ModuleList([
-            EncoderBlock(d_model, use_conv=False, d_state=d_state)  # No conv at deep levels
+            EncoderBlock(d_model, use_conv=False, **ssm_kwargs)  # No conv at deep levels
             for _ in range(n_encoder_layers)
         ])
         self.down3 = DownSample(d_model)
 
         # ===== BOTTLENECK =====
         self.bottleneck_mamba = nn.ModuleList([
-            DualPathBiMambaBlock(d_model, d_state=d_state)
+            DualPathBiMambaBlock(d_model, **ssm_kwargs)
             for _ in range(n_bottleneck_layers // 2)
         ])
         self.bottleneck_attn = nn.ModuleList([
@@ -128,6 +154,88 @@ class VocalSeparator(nn.Module):
         ])
 
         self.spectrogram = SpectrogramTransform(n_fft, hop_length)
+
+    @staticmethod
+    def _normalize_checkpoint_mode(use_gradient_checkpointing: bool | str) -> str:
+        if isinstance(use_gradient_checkpointing, str):
+            mode = use_gradient_checkpointing.strip().lower()
+        elif use_gradient_checkpointing:
+            mode = "full"
+        else:
+            mode = "none"
+
+        aliases = {
+            "true": "full",
+            "false": "none",
+            "off": "none",
+            "all": "full",
+            "encoder_only": "encoder",
+            "decoder_only": "decoder",
+            "bottleneck_only": "bottleneck",
+            "encoder_deep": "encoder_bottleneck",
+            "deep": "bottleneck_decoder",
+            "deep_only": "bottleneck_decoder",
+        }
+        mode = aliases.get(mode, mode)
+        valid_modes = {
+            "none",
+            "full",
+            "encoder",
+            "decoder",
+            "bottleneck",
+            "encoder_bottleneck",
+            "bottleneck_decoder",
+        }
+        if mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported gradient checkpointing mode: {use_gradient_checkpointing!r}"
+            )
+        return mode
+
+    def _should_checkpoint(self, stage: str) -> bool:
+        if not self.training:
+            return False
+        if self.gradient_checkpointing_mode == "full":
+            return True
+        if self.gradient_checkpointing_mode == "encoder":
+            return stage == "encoder"
+        if self.gradient_checkpointing_mode == "decoder":
+            return stage == "decoder"
+        if self.gradient_checkpointing_mode == "bottleneck":
+            return stage == "bottleneck"
+        if self.gradient_checkpointing_mode == "encoder_bottleneck":
+            return stage in {"encoder", "bottleneck"}
+        if self.gradient_checkpointing_mode == "bottleneck_decoder":
+            return stage in {"bottleneck", "decoder"}
+        return False
+
+    def _apply_block(
+        self,
+        module: nn.Module,
+        *inputs: torch.Tensor,
+        checkpoint_stage: str = "encoder",
+    ) -> torch.Tensor:
+        if self._should_checkpoint(checkpoint_stage):
+            return activation_checkpoint(module, *inputs, use_reentrant=True)
+        return module(*inputs)
+
+    def _apply_decoder_block(
+        self,
+        module: nn.Module,
+        x: torch.Tensor,
+        encoder_memory: torch.Tensor,
+        skip: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._should_checkpoint("decoder"):
+            def run_block(
+                x_in: torch.Tensor,
+                memory_in: torch.Tensor,
+                skip_in: torch.Tensor,
+            ) -> torch.Tensor:
+                return module(x_in, encoder_memory=memory_in, skip=skip_in)
+
+            return activation_checkpoint(run_block, x, encoder_memory, skip, use_reentrant=True)
+        return module(x, encoder_memory=encoder_memory, skip=skip)
 
     def stft(self, x: torch.Tensor) -> torch.Tensor:
         """Compute STFT."""
@@ -206,25 +314,25 @@ class VocalSeparator(nn.Module):
         # Level 1
         e1 = x
         for layer in self.enc1:
-            e1 = layer(e1)
+            e1 = self._apply_block(layer, e1)
 
         # Level 2
         e2 = self.down1(e1)
         for layer in self.enc2:
-            e2 = layer(e2)
+            e2 = self._apply_block(layer, e2)
 
         # Level 3
         e3 = self.down2(e2)
         for layer in self.enc3:
-            e3 = layer(e3)
+            e3 = self._apply_block(layer, e3)
 
         # ===== BOTTLENECK =====
         b = self.down3(e3)
 
         # Alternate Mamba and Attention at bottleneck
         for mamba, attn in zip(self.bottleneck_mamba, self.bottleneck_attn):
-            b = mamba(b)
-            b = attn(b)
+            b = self._apply_block(mamba, b, checkpoint_stage="bottleneck")
+            b = self._apply_block(attn, b, checkpoint_stage="bottleneck")
 
         # ===== BUILD MEMORY BANK =====
         # Pool all encoder levels for efficient cross-attention
@@ -235,19 +343,19 @@ class VocalSeparator(nn.Module):
         d3 = self.up3(b)
         d3 = match_time_length(d3, e3.shape[2])
         for layer in self.dec3:
-            d3 = layer(d3, encoder_memory=memory, skip=e3)
+            d3 = self._apply_decoder_block(layer, d3, memory, e3)
 
         # Level 2
         d2 = self.up2(d3)
         d2 = match_time_length(d2, e2.shape[2])
         for layer in self.dec2:
-            d2 = layer(d2, encoder_memory=memory, skip=e2)
+            d2 = self._apply_decoder_block(layer, d2, memory, e2)
 
         # Level 1
         d1 = self.up1(d2)
         d1 = match_time_length(d1, e1.shape[2])
         for layer in self.dec1:
-            d1 = layer(d1, encoder_memory=memory, skip=e1)
+            d1 = self._apply_decoder_block(layer, d1, memory, e1)
 
         # Band merge and mask estimation
         out_L, out_R = self.band_merge(d1, stft_L, stft_R)
@@ -266,6 +374,15 @@ def create_model(
     dropout: float = 0.0,
     use_mid_side: bool = False,
     d_state: int = 32,
+    ssm_variant: str = "mamba",
+    d_conv: int = 4,
+    expand: int = 2,
+    mamba3_headdim: int = 64,
+    mamba3_is_mimo: bool = False,
+    mamba3_mimo_rank: int = 4,
+    mamba3_chunk_size: int = 32,
+    mamba3_is_outproj_norm: bool = False,
+    use_gradient_checkpointing: bool | str = False,
 ) -> VocalSeparator:
     """Factory function to create the separator model."""
     return VocalSeparator(
@@ -280,6 +397,15 @@ def create_model(
         dropout=dropout,
         use_mid_side=use_mid_side,
         d_state=d_state,
+        ssm_variant=ssm_variant,
+        d_conv=d_conv,
+        expand=expand,
+        mamba3_headdim=mamba3_headdim,
+        mamba3_is_mimo=mamba3_is_mimo,
+        mamba3_mimo_rank=mamba3_mimo_rank,
+        mamba3_chunk_size=mamba3_chunk_size,
+        mamba3_is_outproj_norm=mamba3_is_outproj_norm,
+        use_gradient_checkpointing=use_gradient_checkpointing,
     )
 
 

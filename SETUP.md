@@ -145,12 +145,49 @@ Important variables:
 - `INSTR_S3_BUCKET`
 - `INSTR_S3_CHECKPOINT_PREFIX`
 
+Preset configs under `configs/` intentionally omit machine-specific
+dataset/output/checkpoint paths. Supply those at runtime through `.env`,
+exported environment variables, or CLI flags.
+
+For tracked preset configs, training paths should come from:
+
+1. CLI flags: `--data_dirs`, `--output_dir`, `--checkpoint`
+2. Environment / `.env`: `INSTR_DATA_DIRS`, `INSTR_OUTPUT_DIR`, `INSTR_CHECKPOINT_PATH`
+
+Saved run `config.json` files under `./outputs/<experiment_name>/` may also
+contain concrete paths for resume. That is a runtime artifact, not a checked-in
+preset.
+
+## Preset Configs
+
+The tracked presets are:
+
+- `configs/v1.json`: bootstrap-style worker-compatible Mamba preset
+- `configs/mamba3.json`: public Mamba-3 preset
+
 ## First Commands
 
 Train:
 
 ```bash
-python -m training.train
+# after setting INSTR_DATA_DIRS / INSTR_OUTPUT_DIR in .env
+python -m training.train --config configs/mamba3.json
+```
+
+Example with runtime paths from `.env`:
+
+```bash
+# after setting INSTR_DATA_DIRS / INSTR_OUTPUT_DIR in .env
+python -m training.train --config configs/mamba3.json
+```
+
+Equivalent example with explicit CLI overrides:
+
+```bash
+python -m training.train \
+  --config configs/mamba3.json \
+  --data_dirs ./data \
+  --output_dir ./outputs
 ```
 
 For long training runs, prefer a named `tmux` or `screen` session so you can
@@ -160,7 +197,7 @@ Recommended `tmux` flow:
 
 ```bash
 tmux new -s ml-train
-python -m training.train 2>&1 | tee train.log
+python -m training.train --config configs/mamba3.json 2>&1 | tee train.log
 ```
 
 Useful `tmux` commands:
@@ -175,7 +212,7 @@ tmux ls
 
 ```bash
 screen -S ml-train
-python -m training.train 2>&1 | tee train.log
+python -m training.train --config configs/mamba3.json 2>&1 | tee train.log
 ```
 
 Useful `screen` commands:
@@ -256,7 +293,7 @@ it falls back to a stable per-pair hash split for validation.
 You can start with one folder:
 
 ```bash
-INSTR_DATA_DIRS=./data python -m training.train
+INSTR_DATA_DIRS=./data python -m training.train --config configs/mamba3.json
 ```
 
 and later resume from the same checkpoint while adding more folders:

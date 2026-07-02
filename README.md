@@ -7,6 +7,10 @@ predicts a stereo instrumental. For installation, environment variables,
 dataset layout, training commands, resume, and inference, start with
 [SETUP.md](SETUP.md).
 
+Tracked preset configs live in [configs/](configs/). They intentionally omit
+machine-specific dataset/output/checkpoint paths, which should come from `.env`
+or CLI overrides at runtime.
+
 ## Overview
 
 The model is a band-split BiMamba U-Net.

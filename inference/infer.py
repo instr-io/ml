@@ -45,6 +45,7 @@ class VocalRemover:
 
         logger.info(f"Using device: {self.device}")
         logger.info(f"Loaded checkpoint: {checkpoint_path}")
+        logger.info("Inference precision: fp32")
         logger.info(
             "Config: sr=%s d_model=%s layers=%s/%s/%s",
             self.model_sr,
@@ -66,9 +67,8 @@ class VocalRemover:
                 f"chunk_seconds ({chunk_seconds})"
             )
 
-    def _autocast_context(self):
-        if self.device.type == "cuda":
-            return torch.autocast(device_type="cuda", dtype=torch.float16)
+    def _precision_context(self):
+        # Keep inference in fp32 to match training stability and avoid silent AMP use.
         return nullcontext()
 
     def process(
@@ -246,7 +246,7 @@ class VocalRemover:
                 end = start + chunk_samples
 
                 chunk = audio[:, start:end].to(self.device)
-                with self._autocast_context():
+                with self._precision_context():
                     inst_L, inst_R = self.model(chunk[0].unsqueeze(0), chunk[1].unsqueeze(0))
                 chunk_outputs.append(torch.stack([inst_L.squeeze(0).cpu(), inst_R.squeeze(0).cpu()]))
 
@@ -380,7 +380,7 @@ class VocalRemover:
                 chunk_L = chunk_model[0].unsqueeze(0)
                 chunk_R = chunk_model[1].unsqueeze(0)
 
-                with self._autocast_context():
+                with self._precision_context():
                     stft_in_L = self.model.stft(chunk_L)
                     stft_in_R = self.model.stft(chunk_R)
 

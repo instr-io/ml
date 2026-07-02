@@ -2,7 +2,7 @@
 Training loop for vocal separator.
 
 Supports:
-- Mixed precision training
+- FP32 training
 - Gradient accumulation
 - Checkpointing
 - W&B Logging
@@ -14,6 +14,7 @@ import faulthandler
 import logging
 import random
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -27,7 +28,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 from torch.utils.data import DataLoader
-from torch.amp import GradScaler, autocast
 import numpy as np
 from tqdm import tqdm
 
@@ -92,6 +92,22 @@ def _require_explicit_runtime_path(
     )
 
 
+def _finite_audio_stats(name: str, tensor: torch.Tensor) -> str:
+    detached = tensor.detach().float()
+    finite_mask = torch.isfinite(detached)
+    finite_count = int(finite_mask.sum().item())
+    total = detached.numel()
+    if finite_count == 0:
+        return f"{name}: no finite values ({total} elements)"
+
+    finite = detached[finite_mask]
+    return (
+        f"{name}: shape={tuple(detached.shape)} finite={finite_count}/{total} "
+        f"min={float(finite.min()):.5f} max={float(finite.max()):.5f} "
+        f"mean={float(finite.mean()):.5f}"
+    )
+
+
 def get_cosine_schedule_with_warmup(
     optimizer,
     warmup_steps: int,
@@ -117,6 +133,7 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.pin_memory = self.device.type == "cuda"
         set_seed(config.seed)
+        self.use_amp = False
 
         # Setup output directory
         self.output_dir = Path(config.output_dir) / config.experiment_name
@@ -157,6 +174,9 @@ class Trainer:
 
         logger.info(f"Using device: {self.device}")
         logger.info(f"Model parameters: {count_parameters(self.model) / 1e6:.2f}M")
+        logger.info("Training precision: fp32")
+        if config.training.use_amp:
+            logger.warning("Config requested AMP, but training is forced to fp32 for stability.")
         logger.info(
             "Gradient checkpointing mode: "
             f"{getattr(config.training, 'gradient_checkpointing', False)!r}"
@@ -220,9 +240,6 @@ class Trainer:
             warmup_steps=config.training.warmup_steps,
             total_steps=config.training.max_steps,
         )
-
-        # Mixed precision
-        self.scaler = GradScaler() if config.training.use_amp else None
 
         # Training state
         self.global_step = 0
@@ -354,9 +371,6 @@ class Trainer:
             },
         }
 
-        if self.scaler:
-            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
-
         return checkpoint
 
     def handle_failure(self, exc: BaseException):
@@ -428,17 +442,29 @@ class Trainer:
             target_L = batch["inst_L"].to(self.device, non_blocking=self.pin_memory)
             target_R = batch["inst_R"].to(self.device, non_blocking=self.pin_memory)
 
-            # Forward pass with optional AMP
-            with autocast(device_type=self.device.type, enabled=config.use_amp):
+            # Forward pass in fp32 for training stability.
+            with nullcontext():
                 pred_L, pred_R = self.model(original_L, original_R)
                 loss, loss_dict = self.loss_fn(pred_L, pred_R, target_L, target_R)
                 loss = loss / accumulation_steps
 
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    "Encountered non-finite training loss before backward. "
+                    + " | ".join(
+                        [
+                            _finite_audio_stats("original_L", original_L),
+                            _finite_audio_stats("original_R", original_R),
+                            _finite_audio_stats("target_L", target_L),
+                            _finite_audio_stats("target_R", target_R),
+                            _finite_audio_stats("pred_L", pred_L),
+                            _finite_audio_stats("pred_R", pred_R),
+                        ]
+                    )
+                )
+
             # Backward pass
-            if self.scaler:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            loss.backward()
 
             # Accumulate losses for logging (will average when logging)
             for k, v in loss_dict.items():
@@ -450,19 +476,18 @@ class Trainer:
             # Optimizer step
             if accumulated_steps >= accumulation_steps:
                 # Gradient clipping
-                if self.scaler:
-                    self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     config.max_grad_norm,
                 )
+                if not torch.isfinite(grad_norm):
+                    raise RuntimeError(
+                        f"Encountered non-finite gradient norm at step {self.global_step}: "
+                        f"{float(grad_norm)}"
+                    )
 
                 # Step
-                if self.scaler:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
+                self.optimizer.step()
 
                 self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -626,7 +651,7 @@ class Trainer:
             target_R = batch["inst_R"].to(self.device, non_blocking=self.pin_memory)
 
             with torch.no_grad():
-                with autocast(device_type=self.device.type, enabled=self.config.training.use_amp):
+                with nullcontext():
                     pred_L, pred_R = self.model(original_L, original_R)
                     loss, _ = self.loss_fn(pred_L, pred_R, target_L, target_R)
 
@@ -683,7 +708,7 @@ class Trainer:
             target_R = batch["inst_R"][0:1].to(self.device, non_blocking=self.pin_memory)
 
             # Forward pass
-            with autocast(device_type=self.device.type, enabled=self.config.training.use_amp):
+            with nullcontext():
                 pred_L, pred_R = self.model(original_L, original_R)
 
             sr = self.config.audio.sample_rate
@@ -781,7 +806,7 @@ class Trainer:
             target_R = batch["inst_R"][0:1].to(self.device, non_blocking=self.pin_memory)
 
             # Forward pass
-            with autocast(device_type=self.device.type, enabled=self.config.training.use_amp):
+            with nullcontext():
                 pred_L, pred_R = self.model(original_L, original_R)
 
             # Convert to numpy for saving
@@ -896,9 +921,6 @@ class Trainer:
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.global_step = checkpoint["global_step"]
         self.best_loss = checkpoint.get("best_loss", float("inf"))
-
-        if self.scaler and "scaler_state_dict" in checkpoint:
-            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
         logger.info(f"Resumed from step {self.global_step}")
 

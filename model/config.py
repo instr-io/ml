@@ -70,7 +70,8 @@ class TrainingConfig:
     save_every_steps: int = 50
     eval_every_steps: int = 50
     log_every_steps: int = 100
-    use_amp: bool = True
+    # Training is intentionally fp32-only for stability.
+    use_amp: bool = False
     # Backward compatible with bool configs:
     # false -> "none", true -> "full".
     # String modes let us trade speed for memory more gradually.

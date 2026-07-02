@@ -60,6 +60,14 @@ def load_config_from_checkpoint(
             "n_bottleneck_layers",
             "d_state",
             "use_mid_side",
+            "ssm_variant",
+            "d_conv",
+            "expand",
+            "mamba3_headdim",
+            "mamba3_is_mimo",
+            "mamba3_mimo_rank",
+            "mamba3_chunk_size",
+            "mamba3_is_outproj_norm",
         ]:
             if key in ckpt_config:
                 setattr(config.model, key, ckpt_config[key])
@@ -90,6 +98,14 @@ def load_separator(
         dropout=0.0,
         use_mid_side=getattr(config.model, "use_mid_side", False),
         d_state=getattr(config.model, "d_state", 32),
+        ssm_variant=getattr(config.model, "ssm_variant", "mamba"),
+        d_conv=getattr(config.model, "d_conv", 4),
+        expand=getattr(config.model, "expand", 2),
+        mamba3_headdim=getattr(config.model, "mamba3_headdim", 64),
+        mamba3_is_mimo=getattr(config.model, "mamba3_is_mimo", False),
+        mamba3_mimo_rank=getattr(config.model, "mamba3_mimo_rank", 4),
+        mamba3_chunk_size=getattr(config.model, "mamba3_chunk_size", 32),
+        mamba3_is_outproj_norm=getattr(config.model, "mamba3_is_outproj_norm", False),
     ).to(resolved_device)
 
     state_dict = checkpoint.get("model_state_dict", checkpoint.get("model"))

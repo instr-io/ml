@@ -35,6 +35,14 @@ class ModelConfig:
     dropout: float = 0.0
     d_state: int = 32
     use_mid_side: bool = False
+    ssm_variant: str = "mamba"
+    d_conv: int = 4
+    expand: int = 2
+    mamba3_headdim: int = 64
+    mamba3_is_mimo: bool = False
+    mamba3_mimo_rank: int = 4
+    mamba3_chunk_size: int = 32
+    mamba3_is_outproj_norm: bool = False
 
 
 @dataclass
@@ -63,6 +71,10 @@ class TrainingConfig:
     eval_every_steps: int = 50
     log_every_steps: int = 100
     use_amp: bool = True
+    # Backward compatible with bool configs:
+    # false -> "none", true -> "full".
+    # String modes let us trade speed for memory more gradually.
+    gradient_checkpointing: bool | str = False
     num_workers: int = 0
     prefetch_factor: int = 2
 
@@ -126,6 +138,76 @@ def base_config() -> Config:
         loss=LossConfig(),
         training=TrainingConfig(),
         experiment_name="vocal_separator_base",
+    )
+
+
+def mamba3_5060ti_prodlike_config() -> Config:
+    """Near-production Mamba-3 preset sized for a 16 GB RTX 5060 Ti."""
+    return Config(
+        audio=AudioConfig(
+            chunk_seconds=3.0,
+        ),
+        model=ModelConfig(
+            d_model=256,
+            n_heads=4,
+            n_encoder_layers=4,
+            n_decoder_layers=4,
+            n_bottleneck_layers=4,
+            dropout=0.0,
+            d_state=32,
+            use_mid_side=False,
+            ssm_variant="mamba3",
+            d_conv=4,
+            expand=2,
+            mamba3_headdim=64,
+            mamba3_is_mimo=False,
+            mamba3_mimo_rank=4,
+            mamba3_chunk_size=32,
+            mamba3_is_outproj_norm=False,
+        ),
+        training=TrainingConfig(
+            batch_size=1,
+            gradient_accumulation=8,
+            gradient_checkpointing=True,
+            num_workers=0,
+            prefetch_factor=2,
+        ),
+        experiment_name="vocal_separator_mamba3_5060ti_prodlike",
+    )
+
+
+def mamba3_5060ti_reduced_config() -> Config:
+    """Fallback Mamba-3 preset if the near-production depth does not fit."""
+    return Config(
+        audio=AudioConfig(
+            chunk_seconds=3.0,
+        ),
+        model=ModelConfig(
+            d_model=256,
+            n_heads=4,
+            n_encoder_layers=3,
+            n_decoder_layers=3,
+            n_bottleneck_layers=4,
+            dropout=0.0,
+            d_state=32,
+            use_mid_side=False,
+            ssm_variant="mamba3",
+            d_conv=4,
+            expand=2,
+            mamba3_headdim=64,
+            mamba3_is_mimo=False,
+            mamba3_mimo_rank=4,
+            mamba3_chunk_size=32,
+            mamba3_is_outproj_norm=False,
+        ),
+        training=TrainingConfig(
+            batch_size=1,
+            gradient_accumulation=8,
+            gradient_checkpointing=True,
+            num_workers=0,
+            prefetch_factor=2,
+        ),
+        experiment_name="vocal_separator_mamba3_5060ti_reduced",
     )
 
 

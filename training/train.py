@@ -10,8 +10,10 @@ Supports:
 - Audio sample generation
 """
 
+import faulthandler
 import logging
 import random
+import traceback
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -34,7 +36,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from model.arch.separator import create_model, count_parameters
 from model.dataset import collate_fn
-from model.config import Config, RuntimeConfig, base_config, load_runtime_config
+from model.config import (
+    Config,
+    RuntimeConfig,
+    DEFAULT_DATA_DIRS,
+    DEFAULT_OUTPUT_DIR,
+    base_config,
+    load_runtime_config,
+)
 from training.data import build_train_val_datasets
 from training.losses import SeparationLoss
 from training.observability import build_progress_postfix, build_train_metrics
@@ -64,6 +73,23 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _require_explicit_runtime_path(
+    value: Optional[str],
+    *,
+    placeholder: str,
+    env_name: str,
+    flag_name: str,
+) -> str:
+    """Reject placeholder defaults for training launches."""
+    if value and value != placeholder:
+        return value
+    raise RuntimeError(
+        f"{env_name} or {flag_name} is required for training launches that use "
+        "checked-in preset configs. Set it in .env / your environment or pass "
+        f"{flag_name} explicitly."
+    )
 
 
 def get_cosine_schedule_with_warmup(
@@ -98,6 +124,12 @@ class Trainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.samples_dir.mkdir(exist_ok=True)
         config.save(self.output_dir / "config.json")
+        self.crash_log_path = self.output_dir / "crash.log"
+        self._faulthandler_stream = self.crash_log_path.open("a", buffering=1)
+        try:
+            faulthandler.enable(self._faulthandler_stream, all_threads=True)
+        except Exception as e:
+            logger.warning(f"Failed to enable faulthandler crash logging: {e}")
 
         # Build model
         self.model = create_model(
@@ -112,10 +144,23 @@ class Trainer:
             dropout=config.model.dropout,
             use_mid_side=getattr(config.model, 'use_mid_side', False),
             d_state=getattr(config.model, 'd_state', 32),
+            ssm_variant=getattr(config.model, 'ssm_variant', 'mamba'),
+            d_conv=getattr(config.model, 'd_conv', 4),
+            expand=getattr(config.model, 'expand', 2),
+            mamba3_headdim=getattr(config.model, 'mamba3_headdim', 64),
+            mamba3_is_mimo=getattr(config.model, 'mamba3_is_mimo', False),
+            mamba3_mimo_rank=getattr(config.model, 'mamba3_mimo_rank', 4),
+            mamba3_chunk_size=getattr(config.model, 'mamba3_chunk_size', 32),
+            mamba3_is_outproj_norm=getattr(config.model, 'mamba3_is_outproj_norm', False),
+            use_gradient_checkpointing=getattr(config.training, 'gradient_checkpointing', False),
         ).to(self.device)
 
         logger.info(f"Using device: {self.device}")
         logger.info(f"Model parameters: {count_parameters(self.model) / 1e6:.2f}M")
+        logger.info(
+            "Gradient checkpointing mode: "
+            f"{getattr(config.training, 'gradient_checkpointing', False)!r}"
+        )
         self.model_unwrapped = self.model
 
         # Build loss
@@ -253,6 +298,101 @@ class Trainer:
             except Exception as e:
                 logger.warning(f"W&B log failed: {e}")
 
+    def shutdown(self, exit_code: int = 0):
+        """Close W&B and crash logging resources."""
+        if self.wandb_run:
+            try:
+                wandb.finish(exit_code=exit_code)
+            except Exception as e:
+                logger.warning(f"W&B shutdown failed: {e}")
+            finally:
+                self.wandb_run = None
+
+        if getattr(self, "_faulthandler_stream", None):
+            try:
+                self._faulthandler_stream.flush()
+            except Exception:
+                pass
+            try:
+                faulthandler.disable()
+            except Exception:
+                pass
+            try:
+                self._faulthandler_stream.close()
+            except Exception:
+                pass
+            self._faulthandler_stream = None
+
+    def _build_checkpoint_payload(self) -> dict:
+        """Build a serializable checkpoint payload."""
+        checkpoint = {
+            "global_step": self.global_step,
+            "model_state_dict": self.model_unwrapped.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "best_loss": self.best_loss,
+            "config": {
+                "n_fft": self.config.audio.n_fft,
+                "hop_length": self.config.audio.hop_length,
+                "sample_rate": self.config.audio.sample_rate,
+                "chunk_seconds": self.config.audio.chunk_seconds,
+                "d_model": self.config.model.d_model,
+                "n_heads": self.config.model.n_heads,
+                "n_encoder_layers": self.config.model.n_encoder_layers,
+                "n_decoder_layers": self.config.model.n_decoder_layers,
+                "n_bottleneck_layers": self.config.model.n_bottleneck_layers,
+                "d_state": getattr(self.config.model, 'd_state', 32),
+                "use_mid_side": getattr(self.config.model, 'use_mid_side', False),
+                "ssm_variant": getattr(self.config.model, 'ssm_variant', 'mamba'),
+                "d_conv": getattr(self.config.model, 'd_conv', 4),
+                "expand": getattr(self.config.model, 'expand', 2),
+                "mamba3_headdim": getattr(self.config.model, 'mamba3_headdim', 64),
+                "mamba3_is_mimo": getattr(self.config.model, 'mamba3_is_mimo', False),
+                "mamba3_mimo_rank": getattr(self.config.model, 'mamba3_mimo_rank', 4),
+                "mamba3_chunk_size": getattr(self.config.model, 'mamba3_chunk_size', 32),
+                "mamba3_is_outproj_norm": getattr(self.config.model, 'mamba3_is_outproj_norm', False),
+            },
+        }
+
+        if self.scaler:
+            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
+
+        return checkpoint
+
+    def handle_failure(self, exc: BaseException):
+        """Persist a readable crash report and a best-effort emergency checkpoint."""
+        report = (
+            f"\n=== Training failure at step {self.global_step} ===\n"
+            f"{type(exc).__name__}: {exc}\n"
+            f"{traceback.format_exc()}\n"
+        )
+
+        try:
+            with self.crash_log_path.open("a") as fh:
+                fh.write(report)
+        except Exception as write_exc:
+            logger.error(f"Failed to append crash report to {self.crash_log_path}: {write_exc}")
+
+        logger.exception(f"Training failed at step {self.global_step}")
+
+        try:
+            crash_path = self.output_dir / f"crash_step_{self.global_step:06d}.pt"
+            torch.save(self._build_checkpoint_payload(), crash_path)
+            logger.info(f"Saved emergency checkpoint to {crash_path}")
+        except Exception as save_exc:
+            logger.error(f"Failed to save emergency checkpoint: {save_exc}")
+
+        try:
+            self._log_wandb(
+                {
+                    "crash/step": self.global_step,
+                    "crash/type": type(exc).__name__,
+                },
+                self.global_step,
+            )
+        except Exception:
+            pass
+
     def train(self):
         """Main training loop with tqdm progress bar and W&B logging."""
         self.model.train()
@@ -378,8 +518,6 @@ class Trainer:
 
         logger.info("Training complete!")
         self.save_checkpoint()
-        if self.wandb_run:
-            wandb.finish()
 
     @torch.no_grad()
     def _compute_sdr(self, pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -710,29 +848,7 @@ class Trainer:
 
     def save_checkpoint(self, best: bool = False):
         """Save model checkpoint locally and to S3."""
-        checkpoint = {
-            "global_step": self.global_step,
-            "model_state_dict": self.model_unwrapped.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "best_loss": self.best_loss,
-            "config": {
-                "n_fft": self.config.audio.n_fft,
-                "hop_length": self.config.audio.hop_length,
-                "sample_rate": self.config.audio.sample_rate,
-                "chunk_seconds": self.config.audio.chunk_seconds,
-                "d_model": self.config.model.d_model,
-                "n_heads": self.config.model.n_heads,
-                "n_encoder_layers": self.config.model.n_encoder_layers,
-                "n_decoder_layers": self.config.model.n_decoder_layers,
-                "n_bottleneck_layers": self.config.model.n_bottleneck_layers,
-                "d_state": getattr(self.config.model, 'd_state', 32),
-                "use_mid_side": getattr(self.config.model, 'use_mid_side', False),
-            },
-        }
-
-        if self.scaler:
-            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
+        checkpoint = self._build_checkpoint_payload()
 
         # Save regular checkpoint
         path = self.output_dir / f"step_{self.global_step:06d}.pt"
@@ -792,10 +908,26 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Train vocal separator")
-    parser.add_argument("--config", type=str, help="Path to config JSON")
-    parser.add_argument("--data_dirs", type=str, help="Data directories (comma-delimited)")
-    parser.add_argument("--output_dir", type=str, help="Output directory")
-    parser.add_argument("--checkpoint", type=str, help="Resume from checkpoint")
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to a preset config JSON or a saved run config.json",
+    )
+    parser.add_argument(
+        "--data_dirs",
+        type=str,
+        help="Data directories (comma-delimited). Overrides config and .env values.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        help="Output directory. Overrides config and .env values.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        help="Resume from checkpoint. Overrides config and INSTR_CHECKPOINT_PATH.",
+    )
     args = parser.parse_args()
     runtime = load_runtime_config()
 
@@ -805,6 +937,7 @@ def main():
     else:
         config = base_config()
 
+    # Fill runtime paths from `.env` / environment when the preset config omits them.
     config.apply_runtime_defaults(runtime)
 
     # Override with CLI args only if explicitly provided
@@ -815,8 +948,29 @@ def main():
     if args.checkpoint:
         config.checkpoint_path = args.checkpoint
 
+    config.data_dirs = _require_explicit_runtime_path(
+        config.data_dirs,
+        placeholder=DEFAULT_DATA_DIRS,
+        env_name="INSTR_DATA_DIRS",
+        flag_name="--data_dirs",
+    )
+    config.output_dir = _require_explicit_runtime_path(
+        config.output_dir,
+        placeholder=DEFAULT_OUTPUT_DIR,
+        env_name="INSTR_OUTPUT_DIR",
+        flag_name="--output_dir",
+    )
+
     trainer = Trainer(config, runtime=runtime)
-    trainer.train()
+    exit_code = 0
+    try:
+        trainer.train()
+    except BaseException as exc:
+        exit_code = 1
+        trainer.handle_failure(exc)
+        raise
+    finally:
+        trainer.shutdown(exit_code=exit_code)
 
 
 if __name__ == "__main__":
